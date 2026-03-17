@@ -22,12 +22,19 @@ func init() {
 	base.Register("Qwen3NextForConditionalGeneration", NewModel)
 }
 
+var _ base.MultimodalPromptTokenizer = (*Model)(nil)
+var _ base.MultimodalPromptTokenizerWithState = (*Model)(nil)
+var _ base.ForwardWithStateModel = (*Model)(nil)
+
 // RopeParameters carries optional rope metadata embedded under rope_parameters.
 type RopeParameters struct {
 	Type                string  `json:"type"`
 	RopeType            string  `json:"rope_type"`
 	RopeTheta           float32 `json:"rope_theta"`
 	PartialRotaryFactor float32 `json:"partial_rotary_factor"`
+	MRoPEInterleaved    bool    `json:"mrope_interleaved"`
+	MRoPESection        []int32 `json:"mrope_section"`
+	DimensionSections   []int32 `json:"dimension_sections"`
 }
 
 // Config holds Qwen 3.5 text config (top-level or nested text_config).
@@ -67,6 +74,13 @@ type Config struct {
 	PartialRotaryFactor float32         `json:"partial_rotary_factor"`
 	RopeScaling         map[string]any  `json:"rope_scaling"`
 	RopeParameters      *RopeParameters `json:"rope_parameters"`
+	MRoPESections       []int32         `json:"mrope_sections"`
+	MRoPEInterleaved    bool            `json:"mrope_interleaved"`
+
+	Vision           *VisionConfig `json:"vision_config"`
+	ImageTokenID     int32         `json:"image_token_id"`
+	VisionStartToken int32         `json:"vision_start_token_id"`
+	VisionEndToken   int32         `json:"vision_end_token_id"`
 
 	// Quantization metadata.
 	QuantGroupSize int                               `json:"-"`
@@ -90,6 +104,9 @@ type Model struct {
 	*Config
 
 	weightPrefix string
+
+	Vision         *VisionModel
+	ImageProcessor *VisionImageProcessor
 }
 
 // Layer is a transformer decoder layer.
@@ -188,6 +205,18 @@ func parseConfig(configData []byte) (Config, error) {
 		return Config{}, fmt.Errorf("parse config envelope: %w", err)
 	}
 
+	var top struct {
+		Vision           *VisionConfig `json:"vision_config"`
+		ImageTokenID     int32         `json:"image_token_id"`
+		VisionStartToken int32         `json:"vision_start_token_id"`
+		VisionEndToken   int32         `json:"vision_end_token_id"`
+		MRoPESections    []int32       `json:"mrope_sections"`
+		MRoPEInterleaved bool          `json:"mrope_interleaved"`
+	}
+	if err := json.Unmarshal(configData, &top); err != nil {
+		return Config{}, fmt.Errorf("parse top-level config: %w", err)
+	}
+
 	var cfg Config
 	activeRaw := rawTop
 	if textRaw, ok := rawTop["text_config"]; ok {
@@ -202,6 +231,15 @@ func parseConfig(configData []byte) (Config, error) {
 			return Config{}, fmt.Errorf("parse config: %w", err)
 		}
 	}
+
+	cfg.Vision = top.Vision
+	cfg.ImageTokenID = top.ImageTokenID
+	cfg.VisionStartToken = top.VisionStartToken
+	cfg.VisionEndToken = top.VisionEndToken
+	if len(top.MRoPESections) > 0 {
+		cfg.MRoPESections = top.MRoPESections
+	}
+	cfg.MRoPEInterleaved = cfg.MRoPEInterleaved || top.MRoPEInterleaved
 
 	if cfg.HiddenSize <= 0 {
 		return Config{}, fmt.Errorf("invalid hidden_size: %d", cfg.HiddenSize)
@@ -246,6 +284,18 @@ func parseConfig(configData []byte) (Config, error) {
 		if cfg.RopeParameters.PartialRotaryFactor > 0 {
 			cfg.PartialRotaryFactor = cfg.RopeParameters.PartialRotaryFactor
 		}
+		if len(cfg.MRoPESections) == 0 {
+			switch {
+			case len(cfg.RopeParameters.MRoPESection) > 0:
+				cfg.MRoPESections = append([]int32(nil), cfg.RopeParameters.MRoPESection...)
+			case len(cfg.RopeParameters.DimensionSections) > 0:
+				cfg.MRoPESections = append([]int32(nil), cfg.RopeParameters.DimensionSections...)
+			}
+		}
+		cfg.MRoPEInterleaved = cfg.MRoPEInterleaved || cfg.RopeParameters.MRoPEInterleaved
+	}
+	if len(cfg.MRoPESections) > 4 {
+		cfg.MRoPESections = cfg.MRoPESections[:4]
 	}
 	if cfg.RopeTheta == 0 {
 		cfg.RopeTheta = 100000.0
@@ -299,6 +349,19 @@ func parseConfig(configData []byte) (Config, error) {
 	}
 
 	cfg.Scale = float32(1.0 / math.Sqrt(float64(cfg.HeadDim)))
+
+	if cfg.Vision != nil {
+		cfg.Vision.applyDefaults()
+	}
+	if cfg.ImageTokenID == 0 {
+		cfg.ImageTokenID = 151655
+	}
+	if cfg.VisionStartToken == 0 {
+		cfg.VisionStartToken = 151652
+	}
+	if cfg.VisionEndToken == 0 {
+		cfg.VisionEndToken = 151653
+	}
 	return cfg, nil
 }
 
@@ -363,6 +426,11 @@ func NewModel(root *model.Root) (base.Model, error) {
 	cfg, err := parseConfig(configData)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Vision != nil {
+		if preprocessorData, err := root.Manifest.ReadConfig("preprocessor_config.json"); err == nil {
+			cfg.Vision.applyPreprocessorConfig(preprocessorData)
+		}
 	}
 
 	if qt := root.QuantType(); qt != "" {
@@ -1060,6 +1128,15 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.Layers[i] = layer
 	}
 
+	if cfg.Vision != nil && cfg.Vision.Depth > 0 {
+		vision, processor, err := loadVisionComponents(tensors, linears, cfg, m.weightPrefix)
+		if err != nil {
+			return err
+		}
+		m.Vision = vision
+		m.ImageProcessor = processor
+	}
+
 	return nil
 }
 
@@ -1117,7 +1194,51 @@ func splitQKVZBA(mixedQKVZ, mixedBA *mlx.Array, cfg *Config, B, L int32) (q, k, 
 	return q, k, v, z, b, a
 }
 
-func (a *FullAttention) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
+func textRotateHalf(x *mlx.Array) *mlx.Array {
+	shape := x.Dims()
+	last := int32(shape[len(shape)-1])
+	half := last / 2
+	if half <= 0 {
+		return x
+	}
+
+	x1 := mlx.SliceStartStop(x, []int32{0, 0, 0, 0}, []int32{int32(shape[0]), int32(shape[1]), int32(shape[2]), half})
+	x2 := mlx.SliceStartStop(x, []int32{0, 0, 0, half}, []int32{int32(shape[0]), int32(shape[1]), int32(shape[2]), last})
+	return mlx.Concatenate([]*mlx.Array{mlx.Neg(x2), x1}, -1)
+}
+
+func applyTextRoPE(x, cos, sin *mlx.Array, ropeDim int32) *mlx.Array {
+	if x == nil || cos == nil || sin == nil || ropeDim <= 0 {
+		return x
+	}
+
+	shape := x.Dims()
+	if len(shape) != 4 {
+		return x
+	}
+
+	last := int32(shape[len(shape)-1])
+	if ropeDim > last {
+		ropeDim = last
+	}
+	if ropeDim%2 != 0 {
+		ropeDim--
+	}
+	if ropeDim <= 0 {
+		return x
+	}
+
+	rot := mlx.SliceStartStop(x, []int32{0, 0, 0, 0}, []int32{int32(shape[0]), int32(shape[1]), int32(shape[2]), ropeDim})
+	rot = mlx.Add(mlx.Mul(rot, cos), mlx.Mul(textRotateHalf(rot), sin))
+	if ropeDim == last {
+		return rot
+	}
+
+	tail := mlx.SliceStartStop(x, []int32{0, 0, 0, ropeDim}, []int32{int32(shape[0]), int32(shape[1]), int32(shape[2]), last})
+	return mlx.Concatenate([]*mlx.Array{rot, tail}, -1)
+}
+
+func (a *FullAttention) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config, ropeCos, ropeSin *mlx.Array) *mlx.Array {
 	qg := a.QProj.Forward(x)
 	qg = mlx.Reshape(qg, B, L, cfg.NumAttentionHeads, cfg.HeadDim*2)
 	q := mlx.SliceStartStop(qg, []int32{0, 0, 0, 0}, []int32{B, L, cfg.NumAttentionHeads, cfg.HeadDim})
@@ -1140,8 +1261,13 @@ func (a *FullAttention) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Co
 	if c != nil {
 		offset = c.Offset()
 	}
-	q = mlx.RoPEWithBase(q, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, offset)
-	k = mlx.RoPEWithBase(k, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, offset)
+	if ropeCos != nil && ropeSin != nil {
+		q = applyTextRoPE(q, ropeCos, ropeSin, cfg.RopeDim)
+		k = applyTextRoPE(k, ropeCos, ropeSin, cfg.RopeDim)
+	} else {
+		q = mlx.RoPEWithBase(q, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, offset)
+		k = mlx.RoPEWithBase(k, int(cfg.RopeDim), false, cfg.RopeTheta, 1.0, offset)
+	}
 
 	if c != nil {
 		k, v = c.Update(k, v)
@@ -1323,13 +1449,13 @@ func (m *SparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	return mlx.Reshape(y, B, L, cfg.HiddenSize)
 }
 
-func (l *Layer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *mlx.Array {
+func (l *Layer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config, ropeCos, ropeSin *mlx.Array) *mlx.Array {
 	var r *mlx.Array
 	normed := l.InputNorm.Forward(x, cfg.RMSNormEps)
 	if l.IsLinear {
 		r = l.Linear.Forward(normed, c, B, L, cfg)
 	} else {
-		r = l.FullAttn.Forward(normed, c, B, L, cfg)
+		r = l.FullAttn.Forward(normed, c, B, L, cfg, ropeCos, ropeSin)
 	}
 	h := mlx.Add(x, r)
 	r = l.MLP.Forward(l.PostAttentionNorm.Forward(h, cfg.RMSNormEps), cfg)
@@ -1337,16 +1463,27 @@ func (l *Layer) Forward(x *mlx.Array, c cache.Cache, B, L int32, cfg *Config) *m
 }
 
 func (m *Model) Forward(tokens *mlx.Array, caches []cache.Cache) *mlx.Array {
+	return m.ForwardWithState(tokens, caches, nil)
+}
+
+func (m *Model) ForwardWithState(tokens *mlx.Array, caches []cache.Cache, state any) *mlx.Array {
 	dims := tokens.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 
+	startPos := promptStartPosFromCaches(caches)
+	promptState := promptVisionStateFromState(state)
 	h := m.EmbedTokens.Forward(tokens)
+	h = m.applyPromptVisionEmbeddings(h, startPos, promptState)
+	var ropeCos, ropeSin *mlx.Array
+	if len(m.MRoPESections) > 0 {
+		ropeCos, ropeSin = m.buildPromptMRoPECosSin(promptState, startPos, L, h.DType())
+	}
 	for i, layer := range m.Layers {
 		var c cache.Cache
 		if caches != nil && i < len(caches) {
 			c = caches[i]
 		}
-		h = layer.Forward(h, c, B, L, m.Config)
+		h = layer.Forward(h, c, B, L, m.Config, ropeCos, ropeSin)
 	}
 	out := m.Norm.Forward(h, m.RMSNormEps)
 	return out

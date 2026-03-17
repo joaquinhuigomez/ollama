@@ -134,14 +134,19 @@ func CreateModel(opts CreateOptions, p *progress.Progress) error {
 		spinnerKey = "create"
 		capabilities = []string{"completion"}
 
+		configData, _ := os.ReadFile(filepath.Join(opts.ModelDir, "config.json"))
+
 		// Check if model supports thinking based on architecture
-		if supportsThinking(opts.ModelDir) {
+		if supportsThinking(configData) {
 			capabilities = append(capabilities, "thinking")
+		}
+		if supportsVision(configData) {
+			capabilities = append(capabilities, "vision")
 		}
 
 		// Set parser and renderer name based on architecture
-		parserName = getParserName(opts.ModelDir)
-		rendererName = getRendererName(opts.ModelDir)
+		parserName = getParserName(configData)
+		rendererName = getRendererName(configData)
 	} else {
 		modelType = "image generation model"
 		spinnerKey = "imagegen"
@@ -439,14 +444,7 @@ func createModelfileLayers(mf *ModelfileConfig) ([]manifest.Layer, error) {
 }
 
 // supportsThinking checks if the model supports thinking mode based on its architecture.
-// This reads the config.json from the model directory and checks the architectures field.
-func supportsThinking(modelDir string) bool {
-	configPath := filepath.Join(modelDir, "config.json")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return false
-	}
-
+func supportsThinking(data []byte) bool {
 	var cfg struct {
 		Architectures []string `json:"architectures"`
 		ModelType     string   `json:"model_type"`
@@ -485,15 +483,35 @@ func supportsThinking(modelDir string) bool {
 	return false
 }
 
-// getParserName returns the parser name for a model based on its architecture.
-// This reads the config.json from the model directory and determines the appropriate parser.
-func getParserName(modelDir string) string {
-	configPath := filepath.Join(modelDir, "config.json")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return ""
+// supportsVision checks if the model exposes a vision tower in config.json.
+func supportsVision(data []byte) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
 	}
 
+	if visionCfgRaw, ok := raw["vision_config"]; ok {
+		var visionCfg map[string]json.RawMessage
+		if err := json.Unmarshal(visionCfgRaw, &visionCfg); err == nil {
+			if len(visionCfg) > 0 {
+				return true
+			}
+		} else if trimmed := bytes.TrimSpace(visionCfgRaw); len(trimmed) > 0 && string(trimmed) != "null" {
+			return true
+		}
+	}
+
+	for _, key := range []string{"image_token_id", "vision_start_token_id", "vision_end_token_id"} {
+		if _, ok := raw[key]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// getParserName returns the parser name for a model based on its architecture.
+func getParserName(data []byte) string {
 	var cfg struct {
 		Architectures []string `json:"architectures"`
 		ModelType     string   `json:"model_type"`
@@ -534,14 +552,7 @@ func getParserName(modelDir string) string {
 }
 
 // getRendererName returns the renderer name for a model based on its architecture.
-// This reads the config.json from the model directory and determines the appropriate renderer.
-func getRendererName(modelDir string) string {
-	configPath := filepath.Join(modelDir, "config.json")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return ""
-	}
-
+func getRendererName(data []byte) string {
 	var cfg struct {
 		Architectures []string `json:"architectures"`
 		ModelType     string   `json:"model_type"`
